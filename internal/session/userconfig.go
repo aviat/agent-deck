@@ -543,6 +543,17 @@ type UISettings struct {
 	// behavior). Set `= true` (or leave unset) to keep the new default.
 	NewSessionEnterAdvances *bool `toml:"new_session_enter_advances"`
 
+	// PromptFirst opts the new-session dialog into a prompt-first layout. When
+	// true, the dialog leads with an "initial prompt" field that is focused by
+	// default: the user types the task and presses Enter to launch immediately.
+	// The Name field becomes optional — left blank, the session title is
+	// auto-derived from the prompt (a kebab slug, later upgraded by the Claude
+	// session-name sync), and the worktree branch is derived from that same slug.
+	// The prompt is delivered to the agent at launch. Default false: the dialog
+	// keeps today's layout (Name focused first and required), unchanged. The
+	// pointer distinguishes "unset" (nil → default false) from an explicit opt-in.
+	PromptFirst *bool `toml:"prompt_first"`
+
 	// AttachOnCreate controls whether creating a session in the TUI (the `n`
 	// new-session dialog) immediately attaches to the new session's pane
 	// instead of only moving the cursor to it. Default false: creating a
@@ -935,6 +946,17 @@ func (u UISettings) GetNewSessionEnterAdvances() bool {
 		return true // Default: ON (Enter advances; Ctrl+S submits).
 	}
 	return *u.NewSessionEnterAdvances
+}
+
+// GetPromptFirst reports whether the new-session dialog should use the
+// prompt-first layout (prompt field focused first, Name optional and
+// auto-derived). Defaults to false when unset: the dialog keeps today's layout.
+// A literal `prompt_first = true` opts in.
+func (u UISettings) GetPromptFirst() bool {
+	if u.PromptFirst == nil {
+		return false // Default: OFF (today's Name-first layout).
+	}
+	return *u.PromptFirst
 }
 
 // GetAttachOnCreate reports whether the TUI should attach to a newly created

@@ -10542,6 +10542,22 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		// Get values including worktree settings.
 		name, path, command, branchName, worktreeEnabled := h.newDialog.GetValuesWithWorktree()
+
+		// Prompt-first layout ([ui] prompt_first): the user typically types the
+		// task into the prompt field and launches without touching Name. When Name
+		// is blank, derive a kebab title from the prompt so the session is never
+		// nameless; autoName stays true (title unlocked) so the Claude session-name
+		// sync can later upgrade the slug to a real conversation-derived title. An
+		// explicitly typed name is left as-is and locked. GetPrompt is empty in the
+		// default layout, so this is inert there.
+		initialPrompt := h.newDialog.GetPrompt()
+		autoName := h.newDialog.IsAutoName()
+		if autoName {
+			// EffectiveName is the single source of truth (same value the dialog
+			// used for the worktree branch): the autofilled slug, or a fresh slug
+			// from the prompt as a safety net if the Name was somehow left blank.
+			name = h.newDialog.EffectiveName()
+		}
 		// #1706: a relative entry must be anchored to this process's cwd here,
 		// before it reaches the directory-exists check, os.MkdirAll, the
 		// worktree/VCS probe or the instance itself — tmux would otherwise
@@ -10627,6 +10643,15 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			toolOptionsJSON, _ = session.MarshalToolOptions(h.newDialog.GetOMPOptions())
 		}
 
+		// The prompt-first field applies to every tool and takes precedence over
+		// the claude-options "Start query". It rides the existing startup-query
+		// plumbing (threaded through the create-directory confirm dialog too);
+		// delivery differs by tool at launch (claude via StartupQuery, other tools
+		// via StartWithMessage). Inert in the default layout (initialPrompt empty).
+		if initialPrompt != "" {
+			claudeStartQuery = initialPrompt
+		}
+
 		// The account row is offered for every claude-compatible tool (the
 		// options panel's own gate), so harvest it on the same terms rather
 		// than only for the literal "claude" preset — otherwise a custom
@@ -10642,7 +10667,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !worktreeEnabled {
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				h.newDialog.Hide()
-				h.confirmDialog.ShowCreateDirectory(path, name, command, groupPath, toolOptionsJSON, claudeExtraArgs, claudeStartQuery, claudeAccount, launchModelID, parentSessionID, parentProjectPath)
+				h.confirmDialog.ShowCreateDirectory(path, name, command, groupPath, toolOptionsJSON, claudeExtraArgs, claudeStartQuery, claudeAccount, launchModelID, parentSessionID, parentProjectPath, autoName)
 				return h, nil
 			}
 		}
@@ -10703,7 +10728,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			parentSessionID,
 			parentProjectPath,
 			tempID,
-			false, // not auto-named — user went through the full create dialog
+			autoName, // true when the title was auto-derived from the prompt
 		)
 
 	case msg.String() == "esc":
@@ -13417,7 +13442,7 @@ func (h *Home) confirmCreateDirectory() tea.Cmd {
 		}
 		return create(pending.remoteName, opts)
 	}
-	name, path, command, groupPath, pendingToolOpts, pendingExtraArgs, pendingStartQuery, pendingAccount, pendingLaunchModelID, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
+	name, path, command, groupPath, pendingToolOpts, pendingExtraArgs, pendingStartQuery, pendingAccount, pendingLaunchModelID, parentSessionID, parentProjectPath, pendingAutoName := h.confirmDialog.GetPendingSession()
 	h.confirmDialog.Hide()
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		h.setError(fmt.Errorf("failed to create directory: %w", err))
@@ -13443,8 +13468,8 @@ func (h *Home) confirmCreateDirectory() tea.Cmd {
 		nil,
 		parentSessionID,
 		parentProjectPath,
-		"",    // no placeholder — non-worktree sessions are fast
-		false, // not auto-named
+		"", // no placeholder — non-worktree sessions are fast
+		pendingAutoName,
 	)
 }
 
@@ -15503,7 +15528,25 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			slog.String("path", inst.ProjectPath),
 			slog.Bool("sandbox", inst.IsSandboxed()),
 		)
-		if err := inst.Start(); err != nil {
+		// Deliver the initial prompt. For claude it already rode the command line
+		// as StartupQuery (set above); every other tool that can receive a prompt
+		// gets it typed/embedded via StartWithMessage. A tool with no way to
+		// receive one (e.g. the deepseek web profile) falls back to a plain Start,
+		// and we surface a non-fatal warning rather than silently dropping the
+		// task the user typed.
+		var startErr error
+		switch {
+		case tool == "claude" || claudeStartQuery == "":
+			startErr = inst.Start()
+		case inst.PromptDeliveryError() != nil:
+			if setupWarning == "" {
+				setupWarning = fmt.Sprintf("initial prompt not delivered: %v", inst.PromptDeliveryError())
+			}
+			startErr = inst.Start()
+		default:
+			startErr = inst.StartWithMessage(claudeStartQuery)
+		}
+		if err := startErr; err != nil {
 			uiLog.Error("session_create_failed", slog.String("error", err.Error()))
 			return sessionCreatedMsg{err: err, tempID: tempID}
 		}

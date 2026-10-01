@@ -140,6 +140,7 @@ const (
 	focusOptions                     // tool-specific options panel (conditional).
 	focusRemoteMCPs                  // MCPs defined on the target remote (conditional, remote targets only).
 	focusCreate                      // explicit "[ Create session ]" button; the one row where Enter submits.
+	focusPrompt                      // initial prompt/message (prompt-first layout only); default focus, Enter submits.
 )
 
 // New session dialog: outer box and textinput widths stay in sync so long
@@ -161,6 +162,8 @@ type settingDisplay struct {
 
 // NewDialog represents the new session creation dialog.
 type NewDialog struct {
+	promptFirst           bool // [ui] prompt_first: lead with the prompt field (see promptFirstFromConfig).
+	promptInput           textinput.Model
 	nameInput             textinput.Model
 	pathInput             textinput.Model
 	commandInput          textinput.Model
@@ -198,6 +201,7 @@ type NewDialog struct {
 	worktreeEnabled bool
 	worktreeToggled bool // true once the user explicitly toggled the worktree checkbox (vs config default_enabled); see #1185.
 	branchInput     textinput.Model
+	nameAutoSet     bool   // prompt-first: true while Name is auto-filled from the prompt (cleared once the user edits Name).
 	branchAutoSet   bool   // true if branch was auto-derived from session name.
 	branchPrefix    string // configured prefix for auto-generated branch names.
 	branchPicker    *BranchPickerDialog
@@ -370,6 +374,7 @@ func isBareFieldLabel(line string) bool {
 
 // dialogSnapshot captures form state so the recent picker can restore on cancel.
 type dialogSnapshot struct {
+	prompt           string
 	name             string
 	path             string
 	commandCursor    int
@@ -380,6 +385,7 @@ type dialogSnapshot struct {
 	worktreeEnabled  bool
 	worktreeToggled  bool
 	branch           string
+	nameAutoSet      bool
 	branchAutoSet    bool
 	claudeOptions    *session.ClaudeOptions
 	geminiYolo       bool
@@ -446,6 +452,17 @@ func newSessionEnterAdvancesFromConfig() bool {
 	return cfg.UI.GetNewSessionEnterAdvances()
 }
 
+// promptFirstFromConfig reads config.toml [ui] prompt_first. Defaults to false
+// (today's Name-first layout) when the config is missing, unreadable, or the
+// key is unset; a literal `= true` opts into the prompt-first layout.
+func promptFirstFromConfig() bool {
+	cfg, err := session.LoadUserConfig()
+	if err != nil || cfg == nil {
+		return false
+	}
+	return cfg.UI.GetPromptFirst()
+}
+
 // buildInheritedSettings returns display pairs for non-default Docker config values.
 func buildInheritedSettings(docker session.DockerSettings) []settingDisplay {
 	var settings []settingDisplay
@@ -478,11 +495,26 @@ func buildInheritedSettings(docker session.DockerSettings) []settingDisplay {
 
 // NewNewDialog creates a new NewDialog instance
 func NewNewDialog() *NewDialog {
+	promptFirst := promptFirstFromConfig()
+
+	// Create prompt input (prompt-first layout only). The initial message sent
+	// to the agent; focused by default so the user can type the task and press
+	// Enter to launch. When Name is left blank the title is derived from this.
+	promptInput := textinput.New()
+	promptInput.Placeholder = "what should the agent do? (Enter to launch)"
+	promptInput.CharLimit = 1024
+
 	// Create name input
 	nameInput := textinput.New()
 	nameInput.Placeholder = "session-name"
-	nameInput.Focus()
 	nameInput.CharLimit = MaxNameLength
+	if promptFirst {
+		// Prompt owns the default focus; Name is optional and auto-derived.
+		promptInput.Focus()
+		nameInput.Placeholder = "session-name (optional — auto from prompt)"
+	} else {
+		nameInput.Focus()
+	}
 
 	// Create path input
 	pathInput := textinput.New()
@@ -512,6 +544,8 @@ func NewNewDialog() *NewDialog {
 	branchInput.CharLimit = 100
 
 	dlg := &NewDialog{
+		promptFirst:     promptFirst,
+		promptInput:     promptInput,
 		nameInput:       nameInput,
 		pathInput:       pathInput,
 		commandInput:    commandInput,
@@ -558,8 +592,18 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 	d.visible = true
 	d.focusIndex = 0
 	d.validationErr = ""
+	d.promptInput.SetValue("")
 	d.nameInput.SetValue("")
-	d.nameInput.Focus()
+	// In prompt-first mode the Name autocompletes from the prompt until the user
+	// edits it themselves.
+	d.nameAutoSet = d.promptFirst
+	if d.promptFirst {
+		d.promptInput.Focus()
+		d.nameInput.Blur()
+	} else {
+		d.promptInput.Blur()
+		d.nameInput.Focus()
+	}
 	d.suggestionNavigated = false // reset on show
 	d.pathSuggestionCursor = 0    // reset cursor too
 	d.suggestionsActive = false
@@ -718,6 +762,7 @@ func (d *NewDialog) syncInputWidths() {
 	if iw > newDialogInputMaxWidth {
 		iw = newDialogInputMaxWidth
 	}
+	d.promptInput.Width = iw
 	d.nameInput.Width = iw
 	d.pathInput.Width = iw
 	d.commandInput.Width = iw
@@ -818,6 +863,11 @@ func (d *NewDialog) shouldHandleEnterLocally() bool {
 	switch d.currentTarget() {
 	// The Create button is the one row where Enter means "create now".
 	case focusCreate:
+		return false
+	// Prompt-first fast path: type the task, hit Enter, launch. Enter here always
+	// submits regardless of new_session_enter_advances — the whole point of
+	// defaulting focus to the prompt is "write it and press Enter".
+	case focusPrompt:
 		return false
 	// Path opens its own browse dropdown (or advances on a usable path).
 	case focusPath:
@@ -933,6 +983,7 @@ func (d *NewDialog) saveSnapshot() *dialogSnapshot {
 	}
 
 	return &dialogSnapshot{
+		prompt:           d.promptInput.Value(),
 		name:             d.nameInput.Value(),
 		path:             d.pathInput.Value(),
 		commandCursor:    d.commandCursor,
@@ -943,6 +994,7 @@ func (d *NewDialog) saveSnapshot() *dialogSnapshot {
 		worktreeEnabled:  d.worktreeEnabled,
 		worktreeToggled:  d.worktreeToggled,
 		branch:           d.branchInput.Value(),
+		nameAutoSet:      d.nameAutoSet,
 		branchAutoSet:    d.branchAutoSet,
 		claudeOptions:    claudeOpts,
 		geminiYolo:       d.geminiOptions.GetYoloMode(),
@@ -956,6 +1008,7 @@ func (d *NewDialog) saveSnapshot() *dialogSnapshot {
 
 // restoreSnapshot restores form state from a snapshot.
 func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
+	d.promptInput.SetValue(s.prompt)
 	d.nameInput.SetValue(s.name)
 	d.pathInput.SetValue(s.path)
 	d.commandCursor = s.commandCursor
@@ -966,6 +1019,7 @@ func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
 	d.worktreeEnabled = s.worktreeEnabled
 	d.worktreeToggled = s.worktreeToggled
 	d.branchInput.SetValue(s.branch)
+	d.nameAutoSet = s.nameAutoSet
 	d.branchAutoSet = s.branchAutoSet
 	if s.claudeOptions != nil {
 		d.claudeOptions.SetFromOptions(s.claudeOptions)
@@ -985,6 +1039,12 @@ func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
 // previewRecentSession pre-fills the dialog from a recent session row (keeps picker open).
 func (d *NewDialog) previewRecentSession(rs *statedb.RecentSessionRow) {
 	d.nameInput.SetValue(rs.Title)
+	// A recent session supplies an explicit title, so stop deriving the name from
+	// the prompt. The prompt itself is intentionally left as the user typed it:
+	// the recent pick borrows path/tool/options for a new session, and the typed
+	// task is still what should run. (Esc restores the pre-picker prompt via the
+	// snapshot.)
+	d.nameAutoSet = false
 	d.pathInput.SetValue(rs.ProjectPath)
 
 	// Default to shell/custom command mode.
@@ -1217,6 +1277,21 @@ func (d *NewDialog) GetValues() (name, path, command string) {
 	return name, path, command
 }
 
+// GetPrompt returns the trimmed initial prompt typed into the prompt-first
+// field. Empty when the field is unused (it exists only in prompt-first mode) or
+// left blank. Delivered to the agent at launch and, when Name is blank, used to
+// auto-derive the session title (slugFromPrompt).
+func (d *NewDialog) GetPrompt() string {
+	return strings.TrimSpace(d.promptInput.Value())
+}
+
+// IsAutoName reports whether the Name was auto-derived from the prompt (true) as
+// opposed to typed by the user (false). The caller leaves an auto-derived title
+// unlocked so the Claude session-name sync can later upgrade the slug.
+func (d *NewDialog) IsAutoName() bool {
+	return d.nameAutoSet
+}
+
 // GetRemoteValues returns dialog values for a remote host. Unlike GetValues,
 // it does not expand ~ or environment variables locally because those paths
 // belong to the remote machine.
@@ -1247,10 +1322,26 @@ func (d *NewDialog) IsWorktreeExplicit() bool {
 	return d.worktreeToggled
 }
 
-// autoBranchFromName sets the branch input to "<prefix><session-name>" if the
-// name field is non-empty and the branch hasn't been manually edited.
-func (d *NewDialog) autoBranchFromName() {
+// EffectiveName returns the session title the dialog will actually use: the
+// typed Name, or — in prompt-first mode when Name is blank — the slug derived
+// from the prompt. This is the single source of truth for the worktree branch
+// derivation, submit validation, and the local/remote create paths, so a
+// prompt-first launch without a Name never produces an empty branch (the
+// "branch name required" trap) or disagreeing title/branch slugs.
+func (d *NewDialog) EffectiveName() string {
 	name := strings.TrimSpace(d.nameInput.Value())
+	if name == "" && d.promptFirst {
+		if p := strings.TrimSpace(d.promptInput.Value()); p != "" {
+			return slugFromPrompt(p)
+		}
+	}
+	return name
+}
+
+// autoBranchFromName sets the branch input to "<prefix><session-name>" if the
+// effective name is non-empty and the branch hasn't been manually edited.
+func (d *NewDialog) autoBranchFromName() {
+	name := d.EffectiveName()
 	if name == "" {
 		return
 	}
@@ -1667,13 +1758,25 @@ func (d *NewDialog) moveRemoteMCPCursor(step int) {
 // dialog instead of being dropped, so what the user sees is what the server
 // gets.
 func (d *NewDialog) GetRemoteCreateOptions() (session.RemoteAddOptions, string) {
-	name, path, command := d.GetRemoteValues()
+	_, path, command := d.GetRemoteValues()
+	// Use the effective name so a prompt-first remote launch without a typed Name
+	// gets the prompt slug as its title (and matches the worktree branch), rather
+	// than the raw, possibly-empty, name field.
+	name := d.EffectiveName()
 	opts := session.RemoteAddOptions{
 		Tool:    command,
 		Title:   name,
 		Path:    path,
 		Group:   d.GetSelectedGroup(),
 		Sandbox: d.IsSandboxEnabled(),
+	}
+
+	// Remote sessions deliver an initial prompt as the Claude startup query
+	// (--startup-query), which the remote `add` only accepts for a
+	// Claude-compatible tool. Refuse rather than silently drop the task the user
+	// typed into the prompt-first field on an incompatible tool.
+	if prompt := d.GetPrompt(); prompt != "" && !session.IsClaudeCompatible(command) {
+		return opts, "An initial prompt needs a Claude-compatible tool for remote sessions"
 	}
 	if d.remoteTarget && (d.remoteCatalog == nil || len(d.presetCommands) == 0) {
 		return opts, "Remote creation capabilities are not loaded; wait for the remote catalog or reopen the dialog"
@@ -1708,7 +1811,13 @@ func (d *NewDialog) GetRemoteCreateOptions() (session.RemoteAddOptions, string) 
 	switch {
 	case d.isClaudeSelected():
 		opts.Account = d.GetClaudeAccount()
-		opts.StartQuery = d.GetClaudeStartQuery()
+		// The prompt-first field takes precedence over the claude-options
+		// "Start query"; fall back to the latter when the prompt is empty.
+		if prompt := d.GetPrompt(); prompt != "" {
+			opts.StartQuery = prompt
+		} else {
+			opts.StartQuery = d.GetClaudeStartQuery()
+		}
 		claudeOpts := d.GetClaudeOptions()
 		opts.ClaudeOptions = claudeOpts
 		if claudeOpts.SessionMode == "resume" && claudeOpts.ResumeSessionID != "" {
@@ -1749,12 +1858,21 @@ func (d *NewDialog) Validate() string {
 	// Fix: sanitize input to remove surrounding quotes that cause path issues
 	path := strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
 
-	// Check for empty name
+	// Check for empty name. In prompt-first mode the Name is optional — when
+	// blank the title is derived from the prompt — so only refuse when there is
+	// neither a name nor a prompt to name the session after.
 	if name == "" {
-		return "Session name cannot be empty"
+		if d.promptFirst {
+			if strings.TrimSpace(d.promptInput.Value()) == "" {
+				return "Enter a prompt or a session name"
+			}
+		} else {
+			return "Session name cannot be empty"
+		}
 	}
 
-	// Check name length
+	// Check name length (the derived slug is already capped, so this only guards
+	// an explicitly typed name).
 	if len(name) > MaxNameLength {
 		return fmt.Sprintf("Session name too long (max %d characters)", MaxNameLength)
 	}
@@ -1846,7 +1964,11 @@ func (d *NewDialog) rebuildFocusTargets() {
 	// (type name, tool already right, submit) is never interrupted by an advanced
 	// option. In multi-repo mode the single Path field is hidden — its path list
 	// lives under focusMultiRepo below the fold instead.
-	targets := []focusTarget{focusName, focusCommand}
+	targets := []focusTarget{}
+	if d.promptFirst {
+		targets = append(targets, focusPrompt)
+	}
+	targets = append(targets, focusName, focusCommand)
 	if d.selectedToolSupportsModel() {
 		targets = append(targets, focusModel)
 	}
@@ -1919,6 +2041,7 @@ func (d *NewDialog) updateToolOptions() {
 }
 
 func (d *NewDialog) updateFocus() {
+	d.promptInput.Blur()
 	d.nameInput.Blur()
 	d.pathInput.Blur()
 	d.commandInput.Blur()
@@ -1937,6 +2060,8 @@ func (d *NewDialog) updateFocus() {
 	d.modelSuggestionActive = false
 	d.modelSuggestionHidden = false
 	switch d.currentTarget() {
+	case focusPrompt:
+		d.promptInput.Focus()
 	case focusName:
 		d.nameInput.Focus()
 	case focusPath:
@@ -2001,7 +2126,7 @@ func isNewDialogShiftTabKey(msg tea.KeyMsg) bool {
 // keystrokes. Single-letter shortcuts must be suppressed in this state.
 func (d *NewDialog) isTextInputFocused() bool {
 	switch d.currentTarget() {
-	case focusName, focusPath, focusModel, focusBranch:
+	case focusPrompt, focusName, focusPath, focusModel, focusBranch:
 		return true
 	case focusCommand:
 		return d.customCommandSelected() // custom command input
@@ -2754,11 +2879,34 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 
 	// Update focused input.
 	switch cur {
+	case focusPrompt:
+		oldPrompt := d.promptInput.Value()
+		d.promptInput, cmd = d.promptInput.Update(msg)
+		if d.promptInput.Value() != oldPrompt {
+			// Live-autocomplete the Name from the prompt until the user edits Name
+			// themselves (nameAutoSet). An empty prompt clears the autofilled name
+			// so the "(optional)" placeholder returns rather than showing "session".
+			if d.nameAutoSet {
+				if p := strings.TrimSpace(d.promptInput.Value()); p != "" {
+					d.nameInput.SetValue(slugFromPrompt(p))
+				} else {
+					d.nameInput.SetValue("")
+				}
+			}
+			// Keep the worktree branch tracking the autofilled name as it changes.
+			if d.worktreeEnabled && d.branchAutoSet && d.nameAutoSet {
+				d.autoBranchFromName()
+			}
+		}
 	case focusName:
 		oldName := d.nameInput.Value()
 		d.nameInput, cmd = d.nameInput.Update(msg)
-		if d.worktreeEnabled && d.branchAutoSet && d.nameInput.Value() != oldName {
-			d.autoBranchFromName()
+		if d.nameInput.Value() != oldName {
+			// The user typed in Name: stop autocompleting it from the prompt.
+			d.nameAutoSet = false
+			if d.worktreeEnabled && d.branchAutoSet {
+				d.autoBranchFromName()
+			}
 		}
 	case focusPath:
 		oldValue := d.pathInput.Value()
@@ -3220,6 +3368,20 @@ func (d *NewDialog) View() string {
 		}
 	}
 	content.WriteString("\n")
+
+	// Prompt input (prompt-first layout only): the first, default-focused field
+	// so the user can type the task immediately; Enter here launches the session.
+	if d.promptFirst {
+		if cur == focusPrompt {
+			writeActiveLabel("▶ Prompt:")
+		} else {
+			content.WriteString(labelStyle.Render("  Prompt:"))
+		}
+		content.WriteString("\n")
+		content.WriteString("  ")
+		content.WriteString(d.promptInput.View())
+		content.WriteString("\n\n")
+	}
 
 	// Name input
 	if cur == focusName {
