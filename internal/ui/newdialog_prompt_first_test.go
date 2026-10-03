@@ -81,9 +81,13 @@ func TestNewDialog_PromptFirstLayout(t *testing.T) {
 	if got := d.currentTarget(); got != focusPrompt {
 		t.Fatalf("default focus = %v, want focusPrompt", got)
 	}
-	// Enter on the prompt row submits (handled by home.go), not locally.
-	if d.shouldHandleEnterLocally() {
-		t.Fatal("Enter on focusPrompt should submit, not be handled locally")
+	// The prompt is multi-line: Enter is handled locally (newline), not submit.
+	// Ctrl+S is the explicit submit.
+	if !d.shouldHandleEnterLocally() {
+		t.Fatal("Enter on focusPrompt should insert a newline (handled locally)")
+	}
+	if !d.WantsSubmit(tea.KeyMsg{Type: tea.KeyCtrlS}) {
+		t.Fatal("Ctrl+S should submit from the prompt field")
 	}
 
 	// Empty prompt + empty name is refused.
@@ -99,6 +103,26 @@ func TestNewDialog_PromptFirstLayout(t *testing.T) {
 	}
 	if got := d.EffectiveName(); got != "add-a-users-table" {
 		t.Fatalf("EffectiveName() = %q, want %q", got, "add-a-users-table")
+	}
+}
+
+// TestNewDialog_PromptFirstEnterInsertsNewline verifies the prompt is multi-line:
+// Enter adds a newline and keeps focus on the prompt rather than submitting.
+func TestNewDialog_PromptFirstEnterInsertsNewline(t *testing.T) {
+	d := NewNewDialog()
+	d.promptFirst = true
+	d.ShowInGroup("default", "default", "", nil, "")
+	d.rebuildFocusTargets()
+
+	d = typePrompt(d, "line one")
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d = typePrompt(d, "line two")
+
+	if got := d.GetPrompt(); got != "line one\nline two" {
+		t.Fatalf("prompt = %q, want two lines separated by a newline", got)
+	}
+	if d.currentTarget() != focusPrompt {
+		t.Fatalf("focus moved off the prompt on Enter: %v", d.currentTarget())
 	}
 }
 

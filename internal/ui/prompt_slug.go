@@ -2,6 +2,16 @@ package ui
 
 import "strings"
 
+// indentLines prefixes every line of s with prefix. Used to indent the
+// multi-line prompt textarea so each rendered row aligns under its field label.
+func indentLines(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+	return strings.Join(lines, "\n")
+}
+
 // promptSlugMaxWords bounds how many of the prompt's leading words feed the
 // auto-derived title, so a long prompt still yields a short, glanceable name.
 const promptSlugMaxWords = 6

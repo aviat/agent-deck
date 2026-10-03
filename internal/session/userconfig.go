@@ -544,8 +544,9 @@ type UISettings struct {
 	NewSessionEnterAdvances *bool `toml:"new_session_enter_advances"`
 
 	// PromptFirst opts the new-session dialog into a prompt-first layout. When
-	// true, the dialog leads with an "initial prompt" field that is focused by
-	// default: the user types the task and presses Enter to launch immediately.
+	// true, the dialog leads with a multi-line "initial prompt" field that is
+	// focused by default: the user types the task (Enter inserts a newline) and
+	// presses Ctrl+S to launch.
 	// The Name field becomes optional — left blank, the session title is
 	// auto-derived from the prompt (a kebab slug, later upgraded by the Claude
 	// session-name sync), and the worktree branch is derived from that same slug.

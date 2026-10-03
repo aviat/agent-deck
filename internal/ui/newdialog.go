@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -152,6 +153,7 @@ const (
 	newDialogInputWidthPad       = 12 // outer width minus indent ≈ textinput width
 	newDialogInputMinWidth       = 28
 	newDialogInputMaxWidth       = 100
+	newDialogPromptHeight        = 4 // visible rows for the multi-line prompt textarea (prompt-first layout).
 )
 
 // settingDisplay pairs a label with a formatted value for read-only display.
@@ -163,7 +165,7 @@ type settingDisplay struct {
 // NewDialog represents the new session creation dialog.
 type NewDialog struct {
 	promptFirst           bool // [ui] prompt_first: lead with the prompt field (see promptFirstFromConfig).
-	promptInput           textinput.Model
+	promptInput           textarea.Model // multi-line initial prompt; Enter inserts a newline, Ctrl+S submits.
 	nameInput             textinput.Model
 	pathInput             textinput.Model
 	commandInput          textinput.Model
@@ -497,12 +499,17 @@ func buildInheritedSettings(docker session.DockerSettings) []settingDisplay {
 func NewNewDialog() *NewDialog {
 	promptFirst := promptFirstFromConfig()
 
-	// Create prompt input (prompt-first layout only). The initial message sent
-	// to the agent; focused by default so the user can type the task and press
-	// Enter to launch. When Name is left blank the title is derived from this.
-	promptInput := textinput.New()
-	promptInput.Placeholder = "what should the agent do? (Enter to launch)"
-	promptInput.CharLimit = 1024
+	// Create prompt input (prompt-first layout only): a multi-line textarea for
+	// the initial message sent to the agent. Focused by default so the user can
+	// type the task; Enter inserts a newline and Ctrl+S launches. When Name is
+	// left blank the title is derived from this.
+	promptInput := textarea.New()
+	promptInput.Placeholder = "what should the agent do? (Ctrl+S to launch)"
+	promptInput.ShowLineNumbers = false
+	promptInput.Prompt = ""
+	promptInput.CharLimit = 4096
+	promptInput.SetHeight(newDialogPromptHeight)
+	promptInput.Blur()
 
 	// Create name input
 	nameInput := textinput.New()
@@ -762,7 +769,7 @@ func (d *NewDialog) syncInputWidths() {
 	if iw > newDialogInputMaxWidth {
 		iw = newDialogInputMaxWidth
 	}
-	d.promptInput.Width = iw
+	d.promptInput.SetWidth(iw)
 	d.nameInput.Width = iw
 	d.pathInput.Width = iw
 	d.commandInput.Width = iw
@@ -864,11 +871,11 @@ func (d *NewDialog) shouldHandleEnterLocally() bool {
 	// The Create button is the one row where Enter means "create now".
 	case focusCreate:
 		return false
-	// Prompt-first fast path: type the task, hit Enter, launch. Enter here always
-	// submits regardless of new_session_enter_advances — the whole point of
-	// defaulting focus to the prompt is "write it and press Enter".
+	// The prompt is a multi-line textarea: Enter inserts a newline (handled
+	// locally), and Ctrl+S is the explicit submit (WantsSubmit), so a task can
+	// span several lines without launching early.
 	case focusPrompt:
-		return false
+		return true
 	// Path opens its own browse dropdown (or advances on a usable path).
 	case focusPath:
 		return true
@@ -1320,6 +1327,27 @@ func (d *NewDialog) ToggleWorktree() {
 // session (default).
 func (d *NewDialog) IsWorktreeExplicit() bool {
 	return d.worktreeToggled
+}
+
+// syncPromptNameAutocomplete live-fills the Name from the prompt while the name
+// is still auto-derived (nameAutoSet), and keeps an auto-derived worktree branch
+// tracking it. A no-op when the prompt text is unchanged. An empty prompt clears
+// the autofilled name so the "(optional)" placeholder returns rather than
+// showing "session".
+func (d *NewDialog) syncPromptNameAutocomplete(oldPrompt string) {
+	if d.promptInput.Value() == oldPrompt {
+		return
+	}
+	if d.nameAutoSet {
+		if p := strings.TrimSpace(d.promptInput.Value()); p != "" {
+			d.nameInput.SetValue(slugFromPrompt(p))
+		} else {
+			d.nameInput.SetValue("")
+		}
+		if d.worktreeEnabled && d.branchAutoSet {
+			d.autoBranchFromName()
+		}
+	}
 }
 
 // EffectiveName returns the session title the dialog will actually use: the
@@ -2445,6 +2473,10 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 
 		switch msg.String() {
 		case "ctrl+n":
+			if cur == focusPrompt {
+				d.promptInput, cmd = d.promptInput.Update(msg)
+				return d, cmd
+			}
 			// Next suggestion (cursor space includes synthetic "Type custom" at 0).
 			if (cur == focusPath || d.multiRepoEditing) && len(d.pathSuggestions) > 0 {
 				d.pathSoftSelected = false
@@ -2477,6 +2509,10 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			return d, nil
 
 		case "ctrl+p":
+			if cur == focusPrompt {
+				d.promptInput, cmd = d.promptInput.Update(msg)
+				return d, cmd
+			}
 			// Previous suggestion (cursor space includes synthetic "Type custom" at 0).
 			if (cur == focusPath || d.multiRepoEditing) && len(d.pathSuggestions) > 0 {
 				d.pathSoftSelected = false
@@ -2551,6 +2587,12 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			}
 
 		case "down":
+			if cur == focusPrompt {
+				// Multi-line prompt: ↓ moves the cursor within the textarea; Tab
+				// leaves the field.
+				d.promptInput, cmd = d.promptInput.Update(msg)
+				return d, cmd
+			}
 			if cur == focusConductor {
 				total := len(d.conductorSessions) + 1 // +1 for "None"
 				if d.conductorCursor < total-1 {
@@ -2574,6 +2616,11 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			return d, nil
 
 		case "up":
+			if cur == focusPrompt {
+				// Multi-line prompt: ↑ moves the cursor within the textarea.
+				d.promptInput, cmd = d.promptInput.Update(msg)
+				return d, cmd
+			}
 			if cur == focusConductor {
 				if d.conductorCursor > 0 {
 					d.conductorCursor--
@@ -2613,6 +2660,13 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			return d, nil
 
 		case "enter":
+			if cur == focusPrompt {
+				// Multi-line prompt: Enter inserts a newline. Submit is Ctrl+S.
+				oldPrompt := d.promptInput.Value()
+				d.promptInput, cmd = d.promptInput.Update(msg)
+				d.syncPromptNameAutocomplete(oldPrompt)
+				return d, cmd
+			}
 			if cur == focusPath {
 				// Issue #1536: Enter on a path that already resolves to an
 				// existing directory advances to the next field instead of
@@ -2882,22 +2936,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 	case focusPrompt:
 		oldPrompt := d.promptInput.Value()
 		d.promptInput, cmd = d.promptInput.Update(msg)
-		if d.promptInput.Value() != oldPrompt {
-			// Live-autocomplete the Name from the prompt until the user edits Name
-			// themselves (nameAutoSet). An empty prompt clears the autofilled name
-			// so the "(optional)" placeholder returns rather than showing "session".
-			if d.nameAutoSet {
-				if p := strings.TrimSpace(d.promptInput.Value()); p != "" {
-					d.nameInput.SetValue(slugFromPrompt(p))
-				} else {
-					d.nameInput.SetValue("")
-				}
-			}
-			// Keep the worktree branch tracking the autofilled name as it changes.
-			if d.worktreeEnabled && d.branchAutoSet && d.nameAutoSet {
-				d.autoBranchFromName()
-			}
-		}
+		d.syncPromptNameAutocomplete(oldPrompt)
 	case focusName:
 		oldName := d.nameInput.Value()
 		d.nameInput, cmd = d.nameInput.Update(msg)
@@ -3370,16 +3409,19 @@ func (d *NewDialog) View() string {
 	content.WriteString("\n")
 
 	// Prompt input (prompt-first layout only): the first, default-focused field
-	// so the user can type the task immediately; Enter here launches the session.
+	// so the user can type the task immediately. Multi-line — Enter inserts a
+	// newline and Ctrl+S launches.
 	if d.promptFirst {
 		if cur == focusPrompt {
-			writeActiveLabel("▶ Prompt:")
+			writeActiveLabel("▶ Prompt:  (Ctrl+S to create)")
 		} else {
 			content.WriteString(labelStyle.Render("  Prompt:"))
 		}
 		content.WriteString("\n")
-		content.WriteString("  ")
-		content.WriteString(d.promptInput.View())
+		// The textarea renders its own left gutter from SetWidth; a single-space
+		// indent keeps it aligned with the other fields' labels without eating
+		// into the wrapped width on continuation lines.
+		content.WriteString(indentLines(d.promptInput.View(), "  "))
 		content.WriteString("\n\n")
 	}
 
